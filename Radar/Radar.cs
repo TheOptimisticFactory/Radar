@@ -1,18 +1,22 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using ExileCore;
+using ExileCore.PoEMemory.Elements;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared;
 using ExileCore.Shared.Helpers;
+using ExileCore.Shared.Interfaces;
 using GameOffsets;
-using GameOffsets.Components;
 using GameOffsets.Native;
+using MoreLinq;
 using Newtonsoft.Json;
 using SharpDX;
 using SharpDX.Direct3D11;
@@ -29,10 +33,54 @@ using Vector4 = System.Numerics.Vector4;
 
 namespace Radar
 {
+    public class Pattern : IPattern
+    {
+        public Pattern(string pattern, string name)
+        {
+            var arr = pattern.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).ToList();
+            var patternOffset = arr.FindIndex(x => x == "^");
+            if (patternOffset == -1)
+            {
+                patternOffset = 0;
+            }
+            else
+            {
+                arr.RemoveAt(patternOffset);
+            }
+
+            PatternOffset = patternOffset;
+            Bytes = arr.Select(x => x == "??" ? (byte)0 : byte.Parse(x, NumberStyles.HexNumber)).ToArray();
+            Mask = arr.Select(x => x != "??").ToArray();
+            Name = name;
+            while (!Mask[0])
+            {
+                PatternOffset--;
+                Mask = Mask.Skip(1).ToArray();
+                Bytes = Bytes.Skip(1).ToArray();
+            }
+
+            while (!Mask[Mask.Length - 1])
+            {
+                Mask = MoreEnumerable.SkipLast(Mask, 1).ToArray();
+                Bytes = Bytes.SkipLast(1).ToArray();
+            }
+        }
+
+        public string Name { get; }
+        public byte[] Bytes { get; }
+        public bool[] Mask { get; }
+        public int StartOffset => 0;
+        public int PatternOffset { get; }
+        private string _mask;
+        string IPattern.Mask => _mask ?? (_mask = new string(Mask.Select(x => x ? 'x' : '?').ToArray()));
+    }
+
     public class Radar : BaseSettingsPlugin<RadarSettings>
     {
         private const string TextureName = "radar_minimap";
-        private const float GridToWorldMultiplier = 250 / 23f;
+        private const int TileToGridConversion = 23;
+        private const int TileToWorldConversion = 250;
+        public const float GridToWorldMultiplier = TileToWorldConversion / (float)TileToGridConversion;
         private const double TileHeightFinalMultiplier = 125 / 16.0; //this translates the height in the tile metadata to
         private const double CameraAngle = 38.7 * Math.PI / 180;
         private static readonly float CameraAngleCos = (float)Math.Cos(CameraAngle);
@@ -51,6 +99,30 @@ namespace Radar
         private ConcurrentDictionary<string, TargetLocations> _clusteredTargetLocations = new();
         private ConcurrentDictionary<string, List<Vector2i>> _allTargetLocations = new();
         private ConcurrentDictionary<string, RouteDescription> _routes = new();
+        private byte[] _rotationSelectorCache;
+        private byte[] _rotationSelector => _rotationSelectorCache ?? (_rotationSelectorCache = GetRotationSelector());
+        private byte[] _rotationHelperCache;
+        private byte[] _rotationHelper => _rotationHelperCache ?? (_rotationHelperCache = GetRotationHelper());
+
+        private byte[] GetRotationSelector()
+        {
+            var pattern = new Pattern(
+                "^ ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 4c ?? ?? ?? 48 ?? ?? ?? ?? ?? ?? 4c ?? ?? 8b ?? 2b ?? 33 ??",
+                "Terrain Rotation Selector");
+            var address = GameController.Memory.FindPatterns(pattern)[0];
+
+            var realAddress = GameController.Memory.Read<int>(GameController.Memory.AddressOfProcess + address + pattern.PatternOffset) + address + pattern.PatternOffset + 4;
+            return GameController.Memory.ReadBytes(GameController.Memory.AddressOfProcess + realAddress, 8);
+        }
+
+        private byte[] GetRotationHelper()
+        {
+            var pattern = new Pattern("4c ?? ?? ?? 48 ?? ?? ^ ?? ?? ?? ?? 4c ?? ?? 8b ?? 2b ?? 33 ??", "Terrain Rotator Helper");
+            var address = GameController.Memory.FindPatterns(pattern)[0];
+
+            var realAddress = GameController.Memory.Read<int>(GameController.Memory.AddressOfProcess + address + pattern.PatternOffset) + address + pattern.PatternOffset + 4;
+            return GameController.Memory.ReadBytes(GameController.Memory.AddressOfProcess + realAddress, 24);
+        }
 
         public override void AreaChange(AreaInstance area)
         {
@@ -58,15 +130,22 @@ namespace Radar
             if (GameController.Game.IsInGameState || GameController.Game.IsEscapeState)
             {
                 _targetDescriptionsInArea = GetTargetDescriptionsInArea().ToDictionary(x => x.Name);
-                _currentZoneTargetEntityPaths = _targetDescriptionsInArea.Values.Where(x => x.TargetType == TargetType.Entity).Select(x => x.Name).ToHashSet();
+                _currentZoneTargetEntityPaths = Enumerable.ToHashSet(_targetDescriptionsInArea.Values.Where(x => x.TargetType == TargetType.Entity).Select(x => x.Name));
                 _terrainMetadata = GameController.IngameState.Data.DataStruct.Terrain;
-                _rawTerrainData = GameController.Memory.ReadStdVector<byte>(_terrainMetadata.LayerMelee);
+                _rawTerrainData = GameController.Memory.ReadStdVector<byte>(Cast(_terrainMetadata.LayerMelee));
                 _heightData = GetTerrainHeight();
                 _allTargetLocations = GetTargets();
                 _processedTerrainData = GenerateMapTextureAndTerrainData();
                 _clusteredTargetLocations = ClusterTargets();
                 StartPathFinding();
             }
+        }
+
+        private static StdVector Cast(NativePtrArray nativePtrArray)
+        {
+            //PepeLa
+            //this is going to break one day and everyone's gonna be sorry, but I'm leaving this
+            return MemoryMarshal.Cast<NativePtrArray, StdVector>(stackalloc NativePtrArray[] { nativePtrArray })[0];
         }
 
         private void LoadTargets()
@@ -101,9 +180,9 @@ namespace Radar
             var numbers = tiles.SelectMany(x => x.Value.Locations.Select((y, i) => (x.Key, i, y)))
                .ToDictionary(x => $"{x.Key}_{x.i}", x => x.y);
             var pf = new PathFinder(_processedTerrainData, new[] { 1, 2, 3, 4, 5 });
-            foreach (var (name, point) in numbers.OrderBy(x => x.Key).Take(Settings.MaximumPathCount))
+            foreach (var pair in numbers.OrderBy(x => x.Key).Take(Settings.MaximumPathCount))
             {
-                Task.Run(() => FindPath(pf, name, point, routes, cancellationToken));
+                Task.Run(() => FindPath(pf, pair.Key, pair.Value, routes, cancellationToken));
             }
         }
 
@@ -163,6 +242,7 @@ namespace Radar
 
         public override void OnLoad()
         {
+            AppDomain.CurrentDomain.AssemblyResolve += AssemblyResolve;
             LoadTargets();
             Settings.Reload.OnPressed = () =>
             {
@@ -189,15 +269,15 @@ namespace Radar
                     bool alreadyContains = false;
                     _allTargetLocations.AddOrUpdate(path, _ => new List<Vector2i> { positioned.GridPos.Truncate() },
                         // ReSharper disable once AssignmentInConditionalExpression
-                        (_, l) => (alreadyContains = l.Contains(positioned.GridPos.Truncate())) ? l : l.Append(positioned.GridPos.Truncate()).ToList());
+                        (_, l) => (alreadyContains = l.Contains(positioned.GridPos.Truncate())) ? l : Enumerable.Append(l, positioned.GridPos.Truncate()).ToList());
                     if (!alreadyContains)
                     {
-                        var oldValue = _clusteredTargetLocations.GetValueOrDefault(path);
+                        _clusteredTargetLocations.TryGetValue(path, out var oldValue);
                         var newValue = _clusteredTargetLocations.AddOrUpdate(path,
                             _ => ClusterTarget(_targetDescriptionsInArea[path]),
                             (_, _) => ClusterTarget(_targetDescriptionsInArea[path]));
                         //restarting PF is a VERY expensive option, so spare some cycles to check we actually need it
-                        if (oldValue == null || !newValue.Locations.ToHashSet().SetEquals(oldValue.Locations))
+                        if (oldValue == null || !Enumerable.ToHashSet(newValue.Locations).SetEquals(oldValue.Locations))
                         {
                             RestartPathFinding();
                         }
@@ -206,11 +286,27 @@ namespace Radar
             }
         }
 
+        private Assembly AssemblyResolve(object sender, ResolveEventArgs args)
+        {
+            var shortname = args.Name.Substring(0, Math.Max(args.Name.IndexOf(','), 0));
+            switch (shortname)
+            {
+                case "System.Buffers":
+                case "System.Memory":
+                case "System.Numerics.Vectors":
+                case "SixLabors.ImageSharp":
+                    var path = Path.Combine(DirectoryFullName, shortname + ".dll");
+                    return Assembly.LoadFile(path);
+                default:
+                    return null;
+            }
+        }
+
         private float[][] GetTerrainHeight()
         {
-            var rotationSelector = GameController.Game.RotationSelectorValues;
-            var rotationHelper = GameController.Game.RotationHelperValues;
-            var tileData = GameController.Memory.ReadStdVector<TileStructure>(_terrainMetadata.TileDetails);
+            var rotationSelector = _rotationSelector;
+            var rotationHelper = _rotationHelper;
+            var tileData = GameController.Memory.ReadStdVector<TileStructure>(Cast(_terrainMetadata.TgtArray));
             var tileHeightCache = tileData.Select(x => x.SubTileDetailsPtr)
                .Distinct()
                .AsParallel()
@@ -220,22 +316,22 @@ namespace Radar
                     data = GameController.Memory.ReadStdVector<sbyte>(GameController.Memory.Read<SubTileStructure>(addr).SubTileHeight)
                 })
                .ToDictionary(x => x.addr, x => x.data);
-            var gridSizeX = (int)_terrainMetadata.NumCols * TileStructure.TileToGridConversion;
-            var toExclusive = (int)_terrainMetadata.NumRows * TileStructure.TileToGridConversion;
+            var gridSizeX = (int)_terrainMetadata.NumCols * TileToGridConversion;
+            var toExclusive = (int)_terrainMetadata.NumRows * TileToGridConversion;
             var result = new float[toExclusive][];
             Parallel.For(0, toExclusive, y =>
             {
                 result[y] = new float[gridSizeX];
                 for (var x = 0; x < gridSizeX; ++x)
                 {
-                    var tileStructure = tileData[y / TileStructure.TileToGridConversion * (int)_terrainMetadata.NumCols + x / TileStructure.TileToGridConversion];
+                    var tileStructure = tileData[y / TileToGridConversion * (int)_terrainMetadata.NumCols + x / TileToGridConversion];
                     var tileHeightArray = tileHeightCache[tileStructure.SubTileDetailsPtr];
                     var num1 = 0;
                     if (tileHeightArray.Length != 0)
                     {
-                        var gridX = x % TileStructure.TileToGridConversion;
-                        var gridY = y % TileStructure.TileToGridConversion;
-                        var maxCoordInTile = TileStructure.TileToGridConversion - 1;
+                        var gridX = x % TileToGridConversion;
+                        var gridY = y % TileToGridConversion;
+                        var maxCoordInTile = TileToGridConversion - 1;
                         int[] coordHelperArray =
                         {
                             maxCoordInTile - gridX,
@@ -248,7 +344,7 @@ namespace Radar
                         int smallAxisFlip = rotationHelper[rotationIndex + 1];
                         int largeAxisFlip = rotationHelper[rotationIndex + 2];
                         var smallIndex = coordHelperArray[axisSwitch * 2 + smallAxisFlip];
-                        var index = coordHelperArray[largeAxisFlip + (1 - axisSwitch) * 2] * TileStructure.TileToGridConversion + smallIndex;
+                        var index = coordHelperArray[largeAxisFlip + (1 - axisSwitch) * 2] * TileToGridConversion + smallIndex;
                         num1 = tileHeightArray[index];
                     }
 
@@ -274,7 +370,7 @@ namespace Radar
 
         private Dictionary<string, List<Vector2i>> GetTileTargets()
         {
-            var tileData = GameController.Memory.ReadStdVector<TileStructure>(_terrainMetadata.TileDetails);
+            var tileData = GameController.Memory.ReadStdVector<TileStructure>(Cast(_terrainMetadata.TgtArray));
             var ret = new ConcurrentDictionary<string, ConcurrentQueue<Vector2i>>();
             Parallel.For(0, tileData.Length, tileNumber =>
             {
@@ -284,8 +380,8 @@ namespace Radar
                 if (string.IsNullOrEmpty(key))
                     return;
                 var stdTuple2D = new Vector2i(
-                    (int)(tileNumber % _terrainMetadata.NumCols) * TileStructure.TileToGridConversion,
-                    (int)(tileNumber / _terrainMetadata.NumCols) * TileStructure.TileToGridConversion);
+                    (int)(tileNumber % _terrainMetadata.NumCols) * TileToGridConversion,
+                    (int)(tileNumber / _terrainMetadata.NumCols) * TileToGridConversion);
 
                 ret.GetOrAdd(key, _ => new ConcurrentQueue<Vector2i>()).Enqueue(stdTuple2D);
             });
@@ -473,7 +569,7 @@ namespace Radar
                 return null;
             var clusterIndexes = KMeans.Cluster(tileList.Select(x => new Vector2d(x.X, x.Y)).ToArray(), target.ExpectedCount);
             var resultList = new List<Vector2>();
-            foreach (var tileGroup in tileList.Zip(clusterIndexes).GroupBy(x => x.Second))
+            foreach (var tileGroup in tileList.Zip(clusterIndexes, (x, y) => (First: x, Second: y)).GroupBy(x => x.Second))
             {
                 var v = new Vector2();
                 var count = 0;
@@ -546,16 +642,14 @@ namespace Radar
         {
             var ingameUi = GameController.Game.IngameState.IngameUi;
             if (ingameUi.DelveWindow.IsVisible ||
-                ingameUi.AtlasPanel.IsVisible ||
-                ingameUi.SellWindow.IsVisible ||
-                ingameUi.NewSellWindow.IsVisible ||
-                ingameUi.HeistLockerWindow.IsVisible)
+                ingameUi.Atlas.IsVisible ||
+                ingameUi.SellWindow.IsVisible)
             {
                 return;
             }
 
             var map = ingameUi.Map;
-            var largeMap = map.LargeMap;
+            var largeMap = map.LargeMap.AsObject<SubMap>();
             if (largeMap.IsVisible)
             {
                 var mapCenter = largeMap.GetClientRect().TopLeft + largeMap.Shift + largeMap.DefaultShift;
@@ -580,7 +674,7 @@ namespace Radar
             var playerRender = player.GetComponent<ExileCore.PoEMemory.Components.Render>();
             if (playerRender == null)
                 return;
-            var rectangleF = new RectangleF(-playerRender.GridPos.X, -playerRender.GridPos.Y, _areaDimensions.Value.X, _areaDimensions.Value.Y);
+            var rectangleF = new RectangleF(-playerRender.GridPos().X, -playerRender.GridPos().Y, _areaDimensions.Value.X, _areaDimensions.Value.Y);
             var playerHeight = -playerRender.RenderStruct.Height;
             var p1 = mapCenter + TranslateGridDeltaToMapDelta(new Vector2(rectangleF.Left, rectangleF.Top), playerHeight);
             var p2 = mapCenter + TranslateGridDeltaToMapDelta(new Vector2(rectangleF.Right, rectangleF.Top), playerHeight);
@@ -596,7 +690,7 @@ namespace Radar
             var playerRender = player.GetComponent<ExileCore.PoEMemory.Components.Render>();
             if (playerRender == null)
                 return;
-            var playerPosition = new Vector2(playerRender.GridPos.X, playerRender.GridPos.Y);
+            var playerPosition = new Vector2(playerRender.GridPos().X, playerRender.GridPos().Y);
             var playerHeight = -playerRender.RenderStruct.Height;
             var ithElement = 0;
             if (Settings.ShowPathsToTargets && (Settings.ShowAllTargets || Settings.ShowSelectedTargets))
@@ -615,8 +709,10 @@ namespace Radar
 
             if (Settings.ShowAllTargets)
             {
-                foreach (var (tileName, targetList) in _allTargetLocations)
+                foreach (var tl in _allTargetLocations)
                 {
+                    var tileName = tl.Key;
+                    var targetList = tl.Value;
                     var textOffset = (Graphics.MeasureText(tileName) / 2f).ToSdx();
                     foreach (var vector in targetList)
                     {
@@ -629,8 +725,9 @@ namespace Radar
             }
             else if (Settings.ShowSelectedTargets)
             {
-                foreach (var (name, description) in _clusteredTargetLocations)
+                foreach (var tt in _clusteredTargetLocations)
                 {
+                    var (name, description) = (tt.Key, tt.Value);
                     foreach (var clusterPosition in description.Locations)
                     {
                         float clusterHeight = 0;

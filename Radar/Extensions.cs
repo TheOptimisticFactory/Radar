@@ -1,5 +1,6 @@
 ﻿using System.Collections.Generic;
 using System.Text.RegularExpressions;
+using ExileCore.PoEMemory.Components;
 using GameOffsets.Native;
 using SharpDX;
 
@@ -7,6 +8,11 @@ namespace Radar;
 
 public static class Extensions
 {
+    public static SharpDX.Vector3 GridPos(this Render render)
+    {
+        return render.Pos / Radar.GridToWorldMultiplier;
+    }
+
     public static SharpDX.Vector2 ToSdx(this System.Numerics.Vector2 v)
     {
         return new SharpDX.Vector2(v.X, v.Y);

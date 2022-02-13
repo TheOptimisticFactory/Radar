@@ -88,7 +88,7 @@ public class BinaryHeap<TKey, TValue>
         }
 
         value = _storage[0];
-        _storage[0] = _storage[^1];
+        _storage[0] = _storage[_storage.Count - 1];
         _storage.RemoveAt(_storage.Count - 1);
         SieveDown(0);
         return true;

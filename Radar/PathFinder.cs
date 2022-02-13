@@ -62,7 +62,7 @@ public class PathFinder
 
     private float GetExactDistance(Vector2i tile, Dictionary<Vector2i, float> dict)
     {
-        return dict.GetValueOrDefault(tile, Single.PositiveInfinity);
+        return dict.TryGetValue(tile, out var result) ? result : Single.PositiveInfinity;
     }
 
     public IEnumerable<List<Vector2i>> RunFirstScan(Vector2i start, Vector2i target)
@@ -88,7 +88,10 @@ public class PathFinder
 
             localBacktrackDictionary.Add(coord, previous);
             var exactDistance = previousScore + coord.DistanceF(previous);
-            exactDistanceField.TryAdd(coord, exactDistance);
+            if (!exactDistanceField.ContainsKey(coord))
+            {
+                exactDistanceField.Add(coord, exactDistance);
+            }
             queue.Add(exactDistance, coord);
         }
 

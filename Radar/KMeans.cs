@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using MoreLinq.Extensions;
 
 namespace Radar;
 
@@ -35,12 +36,13 @@ public static class KMeans
         {
             var newPointIndex = data.Select((tuple, index) => (tuple, index))
                .Where(x => !selectedClusters.Contains(x.index))
-               .MaxBy(c => selectedClusters.Min(x => Distance(c.tuple, data[x])));
+               .MaxBy(c => selectedClusters.Min(x => Distance(c.tuple, data[x])))
+               .Take(1).First();
             selectedClusters.Add(newPointIndex.index);
         }
 
         var clusterNumbers = selectedClusters.Select((x, i) => (x, i)).ToDictionary(x => x.x, x => x.i);
-        var numArray = data.Select(x => clusterNumbers[selectedClusters.MinBy(y => Distance(x, data[y]))]).ToArray();
+        var numArray = data.Select(x => clusterNumbers[selectedClusters.MinBy(y => Distance(x, data[y])).Take(1).First()]).ToArray();
         return numArray;
     }
 
@@ -90,7 +92,7 @@ public static class KMeans
         {
             for (var index2 = 0; index2 < length; ++index2)
                 distances[index2] = Distance(data[index1], means[index2]);
-            var newClusterIndex = distances.Select((distance, index) => (distance, index)).MinBy(x => x.distance).index;
+            var newClusterIndex = distances.Select((distance, index) => (distance, index)).MinBy(x => x.distance).Take(1).First().index;
             ref var clusterIndex = ref clusteringCopy[index1];
             if (newClusterIndex != clusterIndex)
             {
